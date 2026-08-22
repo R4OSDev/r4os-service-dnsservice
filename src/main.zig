@@ -103,22 +103,25 @@ fn runService(app: *const App) i32 {
 
     var state = DnsState{};
     setLastError(&state, "ready");
-    while (!app.sys.programShouldClose()) {
-        const poll = app.sys.serviceEndpointPoll(handle);
-        if (poll < 0) {
-            _ = app.sys.serviceEndpointUnregister(handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const rc = handleRequest(app, handle, &state);
-            if (rc < 0) {
+    var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
+    while (true) {
+        switch (service_loop.wait(null)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ app, handle, &state });
+                if (rc >= 0) continue;
                 _ = app.sys.serviceEndpointUnregister(handle);
                 return rc;
-            }
+            },
+            .idle, .deadline => {},
+            .stop => break,
+            .failure => |raw| {
+                _ = app.sys.serviceEndpointUnregister(handle);
+                return raw;
+            },
         }
-        app.sys.sleepTicks(1);
     }
 
+    service_loop.report(service_name);
     _ = app.sys.serviceEndpointUnregister(handle);
     app.sys.println("DNSSVC stopped cleanly");
     return 0;
