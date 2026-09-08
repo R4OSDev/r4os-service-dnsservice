@@ -144,7 +144,7 @@ fn handleRequest(app: *const App, handle: u32, state: *DnsState) i32 {
         r4os.abi.net_service_op_dns_resolve_a_result, r4os.abi.net_service_op_dns_resolve_a_server_result => replyResolveResult(app, handle, header.request_id, header.op, request, state),
         else => {
             state.bad_ops +%= 1;
-            return app.sys.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+            return r4os.app_services.replyIfPending(app.sys, handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
         },
     };
 }
@@ -153,13 +153,13 @@ fn replyTextStatus(app: *const App, handle: u32, request_id: u32, state: *const 
     var buf: [512]u8 = .{0} ** 512;
     var w = Writer{ .out = buf[0..] };
     writeStatusText(&w, app, state);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, w.slice());
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, w.slice());
 }
 
 fn replyStatusResult(app: *const App, handle: u32, request_id: u32, state: *DnsState) i32 {
     const status = makeStatusResult(app, state);
     const bytes: [*]const u8 = @ptrCast(&status);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDnsStatus)]);
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDnsStatus)]);
 }
 
 fn replyResolveText(app: *const App, handle: u32, request_id: u32, op: u16, payload: []const u8, state: *DnsState) i32 {
@@ -188,13 +188,13 @@ fn replyResolveText(app: *const App, handle: u32, request_id: u32, op: u16, payl
     w.num(result.timeouts);
     w.text(" last=");
     w.text(spanZ(result.last_error[0..]));
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, w.slice());
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, w.slice());
 }
 
 fn replyResolveResult(app: *const App, handle: u32, request_id: u32, op: u16, payload: []const u8, state: *DnsState) i32 {
     const result = resolveFromPayload(app, state, op, payload);
     const bytes: [*]const u8 = @ptrCast(&result);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDnsResult)]);
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDnsResult)]);
 }
 
 fn resolveFromPayload(app: *const App, state: *DnsState, op: u16, payload: []const u8) r4os.abi.NetServiceDnsResult {
