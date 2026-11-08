@@ -3,6 +3,35 @@
 
 DNSSVC.R4X ist der DNS-Resolver-Service.
 
+Neue Familien-RPCs seit0.90.31 / DNSSVC0.1.6
+--------------------------------------------
+Der neue INFO-/RESOLVE-/RELEASE-Vertrag steht in
+Contract/API/NetworkFamily.txt. Er kopiert vollstaendige relevante Antworten
+in bis zu32 unterschiedliche Adressen und liefert Seiten mit1..16 Eintraegen.
+Frage, Transaktions-ID, Antwortquelle und Port werden geprueft; keine fremden
+Glue-Adressen oder still gekuerzten Erfolgsmengen. Fehler lassen Ausgaben
+unveroeffentlicht. ASCII-Namen und die Serveradresse sind explizit.
+
+Der einzige neue A-/AAAA-Codec liegt beim Besitzer NetDns und wird ueber die
+gepinnten build.zig.zon-Abhaengigkeit und das Hostmapping des benannten
+ZIG_MODULE eingebunden. Es wird keine Kopie von src/address_codec.zig in
+diesem Service angelegt. Der vorhandene R4P-Dispatch sowie die unabhaengige
+alte First-A-Parser-/Cachepolitik bleiben fuer den bisherigen Pfad erhalten.
+
+Die kopierten Seiten belegen dieselben8 originalen Cacheeintraege. Bis zu
+30Sekunden gepinnte Ergebnisse bleiben unveraenderlich; Legacyersetzung
+ueberschreibt sie nicht. Die Lesefrist verlaengert keine DNS-TTL. TTL0 und
+Highbit-TTL0 koennen nicht als neue frische Typed-Antwort wiederverwendet
+werden. Generationen des Anbieter- und Aufruferprozesses bleiben gebunden;
+Clockwechsel, Ablauf, Release oder wirkliches Besitzerende entwerten die Pin.
+Alle Slots gepinnt ergibt Capacity vor einer neuen Netzwerkanfrage.
+
+Anfangs werden A-Antworten ueber IPv4 bedient. Das separate AAAA-Codecbit
+belegt nur Wirefaehigkeit, keine freigegebene IPv6-Verbindung oder AAAA-
+Aufloesung. DNS-over-TCP, IDNA, DNSSEC und neue Negative-Cache/SOA-Politik
+werden nicht vorgetaeuscht. Eine Transaktion hat maximal3Sekunden sowie das
+urspruengliche endliche Callerbudget; Poll beginnt keine neue Transaktion.
+
 Projektstruktur seit 0.51.19:
 - `build.zig` baut den Service als eigenes SDK-Projekt.
 - `build.zig.zon` bindet `r4os_sdk` als Paket.

@@ -1,4 +1,7 @@
 const r4os = @import("r4os");
+const std = @import("std");
+const network = r4os.network_family.common;
+const dns_codec = @import("dns_address_codec");
 
 const service_name = "DNSSVC";
 const selftest_arg = "/SELFTEST";
@@ -18,9 +21,15 @@ const dns_error_max: usize = 32;
 const dns_source_port_base: u16 = 53000;
 
 const DnsCacheEntry = struct {
+    query_id: u64 = 0,
+    query_owner: u32 = 0,
+    query_owner_generation: u64 = 0,
+    query_expires_ns: u64 = 0,
+    query_port: u16 = dns_port,
+    query_answers: dns_codec.Answer = .{},
     valid: bool = false,
     negative: bool = false,
-    name: [dns_name_max]u8 = .{0} ** dns_name_max,
+    name: [256]u8 = .{0} ** 256,
     server: [4]u8 = .{0} ** 4,
     answer: [4]u8 = .{0} ** 4,
     updated_seconds: u64 = 0,
@@ -28,6 +37,9 @@ const DnsCacheEntry = struct {
 };
 
 const DnsState = struct {
+    provider: u64 = 0,
+    next_query: u64 = 1,
+    typed_clock: ?r4os.time_contract.checked.ClockSample = null,
     queries_tx: u64 = 0,
     resolve_requests: u64 = 0,
     responses_rx: u64 = 0,
@@ -101,7 +113,7 @@ fn runService(app: *const App) i32 {
         return r4os.abi.service_api_result_no_endpoint;
     }
 
-    var state = DnsState{};
+    var state = DnsState{ .provider = network.provider(app.sys) catch 0 };
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
     while (true) {
@@ -137,6 +149,7 @@ fn handleRequest(app: *const App, handle: u32, state: *DnsState) i32 {
     state.requests +%= 1;
     const payload_len: usize = @intCast(got);
     const request = payload[0..payload_len];
+    if (header.op >= r4os.abi.network_op_info and header.op <= r4os.abi.network_op_release) return replyNetwork(app, handle, header.request_id, state, header.client_id, header.op, request);
     return switch (header.op) {
         r4os.abi.net_service_op_status => replyTextStatus(app, handle, header.request_id, state),
         r4os.abi.net_service_op_dns_status_result => replyStatusResult(app, handle, header.request_id, state),
@@ -617,10 +630,10 @@ fn cacheLookup(app: *const App, state: *DnsState, name: []const u8, server: [4]u
         const entry = state.cache[i];
         if (!entry.valid) continue;
         if (!cacheEntryFresh(app, entry)) {
-            state.cache[i] = .{};
+            if (!queryPinned(app, state, &state.cache[i])) state.cache[i] = .{};
             continue;
         }
-        if (!sameIp(entry.server, server) or !equalsIgnoreCase(spanZ(entry.name[0..]), name)) continue;
+        if (entry.query_port != dns_port or !sameIp(entry.server, server) or !equalsIgnoreCase(spanZ(entry.name[0..]), name)) continue;
         state.cache_hits +%= 1;
         out.* = entry.answer;
         syncPrimaryCacheFromEntry(state, entry);
@@ -630,7 +643,7 @@ fn cacheLookup(app: *const App, state: *DnsState, name: []const u8, server: [4]u
 }
 
 fn cacheStore(app: *const App, state: *DnsState, name: []const u8, server: [4]u8, answer: [4]u8, result: i32) void {
-    const index = cacheFindSlot(app, state, name, server) orelse cacheReplacementSlot(app, state);
+    const index = cacheFindSlot(app, state, name, server) orelse cacheReplacementSlot(app, state) orelse return;
     state.cache[index] = .{
         .valid = true,
         .negative = result == r4os.abi.dns_result_nxdomain,
@@ -648,9 +661,9 @@ fn cacheFindSlot(app: *const App, state: *DnsState, name: []const u8, server: [4
     var i: usize = 0;
     while (i < state.cache.len) : (i += 1) {
         const entry = state.cache[i];
-        if (!entry.valid) continue;
+        if (!entry.valid or queryPinned(app, state, &state.cache[i])) continue;
         if (!cacheEntryFresh(app, entry)) {
-            state.cache[i] = .{};
+            if (!queryPinned(app, state, &state.cache[i])) state.cache[i] = .{};
             continue;
         }
         if (sameIp(entry.server, server) and equalsIgnoreCase(spanZ(entry.name[0..]), name)) return i;
@@ -658,18 +671,21 @@ fn cacheFindSlot(app: *const App, state: *DnsState, name: []const u8, server: [4
     return null;
 }
 
-fn cacheReplacementSlot(app: *const App, state: *DnsState) usize {
-    var i: usize = 0;
-    while (i < state.cache.len) : (i += 1) {
+fn cacheReplacementSlot(app: *const App, state: *DnsState) ?usize {
+    for (0..state.cache.len) |i| {
+        if (queryPinned(app, state, &state.cache[i])) continue;
         if (!state.cache[i].valid or !cacheEntryFresh(app, state.cache[i])) {
-            state.cache[i] = .{};
             state.cache_next = (i + 1) % state.cache.len;
             return i;
         }
     }
-    const slot = state.cache_next;
-    state.cache_next = (state.cache_next + 1) % state.cache.len;
-    return slot;
+    for (0..state.cache.len) |offset| {
+        const i = (state.cache_next + offset) % state.cache.len;
+        if (queryPinned(app, state, &state.cache[i])) continue;
+        state.cache_next = (i + 1) % state.cache.len;
+        return i;
+    }
+    return null;
 }
 
 fn cacheEntryFresh(app: *const App, entry: DnsCacheEntry) bool {
@@ -697,7 +713,7 @@ fn syncPrimaryCache(app: *const App, state: *DnsState) void {
 
 fn syncPrimaryCacheFromEntry(state: *DnsState, entry: DnsCacheEntry) void {
     state.cache_valid = entry.valid;
-    state.cache_name = entry.name;
+    copyFixed(&state.cache_name, spanZ(&entry.name));
     state.cache_server = entry.server;
     state.cache_answer = entry.answer;
     state.cache_updated_seconds = entry.updated_seconds;
@@ -1053,3 +1069,155 @@ const Writer = struct {
         self.num(value[3]);
     }
 };
+
+fn replyNetwork(app: *const App, endpoint: u32, request_id: u32, state: *DnsState, owner: u32, op: u16, payload: []const u8) i32 {
+    const rc = networkRequest(app, endpoint, request_id, state, owner, op, payload) catch |err|
+        r4os.app_services.replyIfPending(app.sys, endpoint, request_id, network.code(err), "");
+    return if (rc == r4os.abi.service_api_result_not_found) 0 else rc;
+}
+fn advanceQueries(state: *DnsState, now: r4os.time_contract.checked.ClockSample) void {
+    const changed = if (state.typed_clock) |old| !std.meta.eql(old.identity, now.identity) or now.instant_ns < old.instant_ns else false;
+    for (&state.cache) |*entry| {
+        if (entry.query_id == 0) continue;
+        if (changed) {
+            entry.* = .{};
+            continue;
+        }
+        if (now.instant_ns >= entry.query_expires_ns) {
+            entry.query_id = 0;
+            entry.query_owner = 0;
+        }
+    }
+    state.typed_clock = now;
+}
+fn queryPinned(app: *const App, state: *const DnsState, entry: *const DnsCacheEntry) bool {
+    if (entry.query_id == 0) return false;
+    const old = state.typed_clock orelse return true;
+    const now = network.sample(app.sys) catch return true;
+    if (network.ownerGone(app.sys, .{ .instance_id = entry.query_owner, .generation = entry.query_owner_generation })) return false;
+    return std.meta.eql(old.identity, now.identity) and now.instant_ns >= old.instant_ns and now.instant_ns < entry.query_expires_ns;
+}
+fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *DnsState, owner: u32, op: u16, payload: []const u8) network.Error!i32 {
+    const a = r4os.abi;
+    if (state.provider == 0) return error.Backend;
+    if (op == a.network_op_info) {
+        if (payload.len != 0) return error.Invalid;
+        const info: a.NetworkProviderInfo = .{ .provider = state.provider, .capabilities = a.network_cap_ipv4 | a.network_cap_dns_a | a.network_cap_dns_aaaa_codec, .max_answers = 32, .page_capacity = 16 };
+        return r4os.app_services.replyIfPending(app.sys, endpoint, request_id, 0, std.mem.asBytes(&info));
+    }
+    if (op != a.network_op_resolve and op != a.network_op_release) return error.UnsupportedPolicy;
+    const req = try network.record(a.NetworkResolveRequest, payload);
+    if (req.provider != state.provider) return error.ProviderChanged;
+    const process = try network.owner(app.sys, owner);
+    const now = try network.sample(app.sys);
+    advanceQueries(state, now);
+    for (&state.cache) |*entry| {
+        if (entry.query_id != 0 and !queryPinned(app, state, entry)) {
+            entry.query_id = 0;
+            entry.query_owner = 0;
+        }
+    }
+    if (req.query != 0) {
+        const expected: a.NetworkResolveRequest = .{ .provider = req.provider, .query = req.query, .family = 0, .cursor = if (op == a.network_op_release) 0 else req.cursor, .capacity = if (op == a.network_op_release) 0 else req.capacity };
+        if (!std.mem.eql(u8, std.mem.asBytes(&req), std.mem.asBytes(&expected))) return error.Invalid;
+        for (&state.cache) |*entry| {
+            if (entry.query_id != req.query or entry.query_owner != owner or entry.query_owner_generation != process.generation) continue;
+            if (op == a.network_op_release) {
+                entry.query_id = 0;
+                entry.query_owner = 0;
+                return r4os.app_services.replyIfPending(app.sys, endpoint, request_id, 0, "");
+            }
+            return networkPage(app, endpoint, request_id, state, entry, req.cursor, req.capacity);
+        }
+        return error.NotFound;
+    }
+    if (op == a.network_op_release or req.cursor != 0 or req.capacity == 0 or req.capacity > 16 or req.reserved != 0 or req.name_len == 0 or req.name_len > 254 or !std.mem.allEqual(u8, req.name[req.name_len..], 0)) return error.Invalid;
+    try network.policy(req.policy);
+    if (req.family != 4) return if (req.family == 6) error.UnsupportedFamily else error.Invalid;
+    const limit = try network.tickDeadline(app.sys, req.deadline);
+    var server = req.server;
+    if (std.mem.allEqual(u8, std.mem.asBytes(&server), 0)) server = network.v4Endpoint(configuredDnsServer(app, state) orelse return error.Backend, dns_port);
+    const ip = try network.ipv4(server, false);
+    if (std.mem.allEqual(u8, &ip, 0)) return error.Invalid;
+    if (state.next_query == 0) return error.Capacity;
+    // Reserve one original cache entry before any network work. Pinned pages
+    // are immutable and never evicted by a legacy cache replacement.
+    const slot = cacheReplacementSlot(app, state) orelse return error.Capacity;
+    const name = req.name[0..req.name_len];
+    var query_buffer: [512]u8 = undefined;
+    const id = nextDnsId(state);
+    const query_length = dns_codec.buildQuery(id, name, .ipv4, &query_buffer) catch return error.Invalid;
+    const raw = app.net.udpBind(dnsSourcePort(id));
+    if (raw <= 0) return error.Backend;
+    const socket: u32 = @intCast(raw);
+    defer _ = app.net.udpClose(socket);
+    const sent = app.net.udpSendTo(socket, ip, server.port, query_buffer[0..query_length]);
+    if (sent != 0 and sent != query_length) return error.Backend;
+    state.queries_tx +%= 1;
+    state.resolve_requests +%= 1;
+    const operation_limit = std.math.add(u64, app.sys.ticks(), app.sys.ticksFromMilliseconds(dns_timeout_ms)) catch return error.Invalid;
+    const tick_limit = if (limit) |value| @min(value, operation_limit) else operation_limit;
+    var response: [dns_codec.max_message]u8 = undefined;
+    var answers: dns_codec.Answer = .{};
+    while (true) {
+        try network.checkAttempt(app.sys, req.deadline);
+        if (app.sys.ticks() >= tick_limit) {
+            state.timeouts +%= 1;
+            return error.Timeout;
+        }
+        var info: a.UdpRecvInfo = .{};
+        const got = app.net.udpRecvFrom(socket, &info, &response);
+        if (got < 0) return error.Backend;
+        if (got > 0 and info.source_port == server.port and sameIp(info.source_ip, ip)) {
+            state.responses_rx +%= 1;
+            dns_codec.parseResponse(response[0..@intCast(got)], id, name, .ipv4, &answers) catch |err| switch (err) {
+                error.Mismatch => continue,
+                error.Truncated => return error.TruncatedDns,
+                error.NotFound, error.NoData => return error.NotFound,
+                error.Capacity => return error.Capacity,
+                else => {
+                    state.malformed +%= 1;
+                    return error.Invalid;
+                },
+            };
+            break;
+        }
+        app.sys.sleepTicks(1);
+    }
+    // Recheck exact source clock/deadline before publishing copied results.
+    try network.checkAttempt(app.sys, req.deadline);
+    if (!network.ownerAlive(app.sys, process)) return error.BadSocket;
+    const completed = try network.sample(app.sys);
+    advanceQueries(state, completed);
+    const expiry = std.math.add(u64, completed.instant_ns, a.network_lease_ns) catch return error.Capacity;
+    const query = state.next_query;
+    state.next_query = std.math.add(u64, query, 1) catch 0;
+    state.cache[slot] = .{ .valid = true, .server = ip, .answer = answers.addresses[0].bytes[0..4].*, .updated_seconds = nowSeconds(app), .ttl_seconds = answers.ttl_seconds, .query_id = query, .query_owner = owner, .query_owner_generation = process.generation, .query_expires_ns = expiry, .query_answers = answers, .query_port = server.port };
+    copyFixed(&state.cache[slot].name, name);
+    state.cache_stores +%= 1;
+    state.a_records +%= answers.count;
+    const rc = try networkPage(app, endpoint, request_id, state, &state.cache[slot], 0, req.capacity);
+    if (rc == a.service_api_result_not_found) {
+        state.cache[slot].query_id = 0;
+        state.cache[slot].query_owner = 0;
+        return 0;
+    }
+    return rc;
+}
+fn networkPage(app: *const App, endpoint: u32, request_id: u32, state: *DnsState, entry: *const DnsCacheEntry, cursor: u32, capacity: u32) network.Error!i32 {
+    const a = r4os.abi;
+    if (capacity == 0 or capacity > 16 or cursor >= entry.query_answers.count) return error.Invalid;
+    const count = @min(capacity, entry.query_answers.count - cursor);
+    const next = cursor + count;
+    const page: a.NetworkResolvePage = .{ .provider = state.provider, .query = entry.query_id, .expires_ns = entry.query_expires_ns, .next = @intCast(next), .count = @intCast(count), .total = @intCast(entry.query_answers.count), .flags = if (next < entry.query_answers.count) a.network_flag_more else 0 };
+    var response: [4096]u8 = undefined;
+    @memcpy(response[0..@sizeOf(a.NetworkResolvePage)], std.mem.asBytes(&page));
+    for (0..count) |i| {
+        const source = entry.query_answers.addresses[cursor + i];
+        const address: a.NetworkResolveAnswer = .{ .address = .{ .family = @intFromEnum(source.family), .bytes = source.bytes }, .ttl_seconds = @min(source.ttl_seconds, entry.query_answers.ttl_seconds) };
+        @memcpy(response[@sizeOf(a.NetworkResolvePage) + i * @sizeOf(a.NetworkResolveAnswer) ..][0..@sizeOf(a.NetworkResolveAnswer)], std.mem.asBytes(&address));
+    }
+    // Unlike the normal helper, preserve NOT_FOUND so a lost initial reply
+    // can release its newly created page lease without leaking a cache slot.
+    return app.sys.serviceEndpointReply(endpoint, request_id, 0, response[0 .. @sizeOf(a.NetworkResolvePage) + count * @sizeOf(a.NetworkResolveAnswer)]);
+}

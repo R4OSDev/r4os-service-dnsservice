@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.2`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SERVICES/DNSSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
