@@ -2,6 +2,7 @@ const r4os = @import("r4os");
 const std = @import("std");
 const network = r4os.network_family.common;
 const dns_codec = @import("dns_address_codec");
+const resolvers = @import("resolvers.zig");
 
 const service_name = "DNSSVC";
 const selftest_arg = "/SELFTEST";
@@ -21,6 +22,9 @@ const dns_error_max: usize = 32;
 const dns_source_port_base: u16 = 53000;
 
 const DnsCacheEntry = struct {
+    typed_only: bool = false,
+    typed_server: r4os.abi.NetworkEndpoint = .{},
+    pending_socket: r4os.abi.NetworkSocketResult = .{},
     query_id: u64 = 0,
     query_owner: u32 = 0,
     query_owner_generation: u64 = 0,
@@ -44,6 +48,7 @@ const DnsState = struct {
     resolve_requests: u64 = 0,
     responses_rx: u64 = 0,
     a_records: u64 = 0,
+    aaaa_records: u64 = 0,
     timeouts: u64 = 0,
     nxdomain: u64 = 0,
     tx_errors: u64 = 0,
@@ -117,7 +122,9 @@ fn runService(app: *const App) i32 {
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
     while (true) {
-        switch (service_loop.wait(null)) {
+        const pending_cleanup = cleanupDnsSockets(app, &state);
+        const cleanup_ticks = app.sys.ticksFromMilliseconds(1000);
+        switch (service_loop.wait(if (pending_cleanup and cleanup_ticks != 0) app.sys.ticks() +| cleanup_ticks else null)) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ app, handle, &state });
                 if (rc >= 0) continue;
@@ -628,7 +635,7 @@ fn cacheLookup(app: *const App, state: *DnsState, name: []const u8, server: [4]u
     var i: usize = 0;
     while (i < state.cache.len) : (i += 1) {
         const entry = state.cache[i];
-        if (!entry.valid) continue;
+        if (!entry.valid or entry.typed_only) continue;
         if (!cacheEntryFresh(app, entry)) {
             if (!queryPinned(app, state, &state.cache[i])) state.cache[i] = .{};
             continue;
@@ -699,7 +706,7 @@ fn syncPrimaryCache(app: *const App, state: *DnsState) void {
     var i: usize = 0;
     while (i < state.cache.len) : (i += 1) {
         const entry = state.cache[i];
-        if (!entry.valid or !cacheEntryFresh(app, entry)) continue;
+        if (!entry.valid or entry.typed_only or !cacheEntryFresh(app, entry)) continue;
         syncPrimaryCacheFromEntry(state, entry);
         return;
     }
@@ -1080,7 +1087,9 @@ fn advanceQueries(state: *DnsState, now: r4os.time_contract.checked.ClockSample)
     for (&state.cache) |*entry| {
         if (entry.query_id == 0) continue;
         if (changed) {
+            const pending = entry.pending_socket;
             entry.* = .{};
+            entry.pending_socket = pending;
             continue;
         }
         if (now.instant_ns >= entry.query_expires_ns) {
@@ -1091,6 +1100,7 @@ fn advanceQueries(state: *DnsState, now: r4os.time_contract.checked.ClockSample)
     state.typed_clock = now;
 }
 fn queryPinned(app: *const App, state: *const DnsState, entry: *const DnsCacheEntry) bool {
+    if (entry.pending_socket.socket != 0) return true;
     if (entry.query_id == 0) return false;
     const old = state.typed_clock orelse return true;
     const now = network.sample(app.sys) catch return true;
@@ -1102,7 +1112,16 @@ fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *DnsSt
     if (state.provider == 0) return error.Backend;
     if (op == a.network_op_info) {
         if (payload.len != 0) return error.Invalid;
-        const info: a.NetworkProviderInfo = .{ .provider = state.provider, .capabilities = a.network_cap_ipv4 | a.network_cap_dns_a | a.network_cap_dns_aaaa_codec, .max_answers = 32, .page_capacity = 16 };
+        var info: a.NetworkProviderInfo = .{ .provider = state.provider, .capabilities = a.network_cap_dns_aaaa_codec, .max_answers = 32, .page_capacity = 16 };
+        var udp: r4os.network_family.Client = undefined;
+        if (r4os.network_family.Client.connectProvider(app.sys, .udp, &udp) == 0) {
+            defer _ = udp.close();
+            var backend: a.NetworkProviderInfo = .{};
+            if (udp.info(&backend) == 0 and backend.capabilities & a.network_cap_udp != 0) {
+                info.capabilities |= backend.capabilities & (a.network_cap_ipv4 | a.network_cap_ipv6);
+                if (info.capabilities & (a.network_cap_ipv4 | a.network_cap_ipv6) != 0) info.capabilities |= a.network_cap_dns_a | a.network_cap_dns_aaaa;
+            }
+        }
         return r4os.app_services.replyIfPending(app.sys, endpoint, request_id, 0, std.mem.asBytes(&info));
     }
     if (op != a.network_op_resolve and op != a.network_op_release) return error.UnsupportedPolicy;
@@ -1133,57 +1152,59 @@ fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *DnsSt
     }
     if (op == a.network_op_release or req.cursor != 0 or req.capacity == 0 or req.capacity > 16 or req.reserved != 0 or req.name_len == 0 or req.name_len > 254 or !std.mem.allEqual(u8, req.name[req.name_len..], 0)) return error.Invalid;
     try network.policy(req.policy);
-    if (req.family != 4) return if (req.family == 6) error.UnsupportedFamily else error.Invalid;
-    const limit = try network.tickDeadline(app.sys, req.deadline);
-    var server = req.server;
-    if (std.mem.allEqual(u8, std.mem.asBytes(&server), 0)) server = network.v4Endpoint(configuredDnsServer(app, state) orelse return error.Backend, dns_port);
-    const ip = try network.ipv4(server, false);
-    if (std.mem.allEqual(u8, &ip, 0)) return error.Invalid;
+    if (req.family != 4 and req.family != 6) return error.Invalid;
+    _ = try network.tickDeadline(app.sys, req.deadline);
+    const left = try network.remaining(app.sys, req.deadline);
+    const operation = try network.deadline(now, .{ .kind = a.timeout_kind_finite, .nanoseconds = @min(if (left.kind == 2) @as(u64, 3_000_000_000) else left.value, 3_000_000_000) });
+    const servers = try configuredResolvers(app, state, req.server);
     if (state.next_query == 0) return error.Capacity;
-    // Reserve one original cache entry before any network work. Pinned pages
-    // are immutable and never evicted by a legacy cache replacement.
+    // One original cache slot also retains any uncertain UDP close. Neither
+    // pinned answer pages nor an unacknowledged socket can be overwritten.
     const slot = cacheReplacementSlot(app, state) orelse return error.Capacity;
     const name = req.name[0..req.name_len];
+    const family: dns_codec.Family = if (req.family == 4) .ipv4 else .ipv6;
     var query_buffer: [512]u8 = undefined;
     const id = nextDnsId(state);
-    const query_length = dns_codec.buildQuery(id, name, .ipv4, &query_buffer) catch return error.Invalid;
-    const raw = app.net.udpBind(dnsSourcePort(id));
-    if (raw <= 0) return error.Backend;
-    const socket: u32 = @intCast(raw);
-    defer _ = app.net.udpClose(socket);
-    const sent = app.net.udpSendTo(socket, ip, server.port, query_buffer[0..query_length]);
-    if (sent != 0 and sent != query_length) return error.Backend;
-    state.queries_tx +%= 1;
+    const query_length = dns_codec.buildQuery(id, name, family, &query_buffer) catch return error.Invalid;
+    var udp: r4os.network_family.Client = undefined;
+    if (r4os.network_family.Client.connectProvider(app.sys, .udp, &udp) != 0) return error.Backend;
+    defer _ = udp.close();
+    var backend: a.NetworkProviderInfo = .{};
+    if (udp.info(&backend) != 0 or backend.capabilities & a.network_cap_udp == 0) return error.Backend;
     state.resolve_requests +%= 1;
-    const operation_limit = std.math.add(u64, app.sys.ticks(), app.sys.ticksFromMilliseconds(dns_timeout_ms)) catch return error.Invalid;
-    const tick_limit = if (limit) |value| @min(value, operation_limit) else operation_limit;
-    var response: [dns_codec.max_message]u8 = undefined;
     var answers: dns_codec.Answer = .{};
-    while (true) {
-        try network.checkAttempt(app.sys, req.deadline);
-        if (app.sys.ticks() >= tick_limit) {
-            state.timeouts +%= 1;
-            return error.Timeout;
+    var selected: ?a.NetworkEndpoint = null;
+    var last_error: network.Error = error.Backend;
+    for (servers.entries[0..servers.count], 0..) |resolver, resolver_index| {
+        try network.checkAttempt(app.sys, operation);
+        const server: a.NetworkEndpoint = .{ .port = resolver.port, .address = .{ .family = resolver.family, .bytes = resolver.bytes, .scope_id = resolver.scope, .interface_id = resolver.interface } };
+        const required = if (server.address.family == 6) a.network_cap_ipv6 else a.network_cap_ipv4;
+        if (backend.capabilities & required == 0) {
+            last_error = error.UnsupportedFamily;
+            continue;
         }
-        var info: a.UdpRecvInfo = .{};
-        const got = app.net.udpRecvFrom(socket, &info, &response);
-        if (got < 0) return error.Backend;
-        if (got > 0 and info.source_port == server.port and sameIp(info.source_ip, ip)) {
-            state.responses_rx +%= 1;
-            dns_codec.parseResponse(response[0..@intCast(got)], id, name, .ipv4, &answers) catch |err| switch (err) {
-                error.Mismatch => continue,
-                error.Truncated => return error.TruncatedDns,
-                error.NotFound, error.NoData => return error.NotFound,
-                error.Capacity => return error.Capacity,
-                else => {
-                    state.malformed +%= 1;
-                    return error.Invalid;
-                },
-            };
-            break;
-        }
-        app.sys.sleepTicks(1);
+        const remaining = try network.remaining(app.sys, operation);
+        if (remaining.kind == 0) return error.Timeout;
+        // A silent first server cannot consume the whole ordered list's
+        // original finite budget. No family or query type is changed.
+        const share = @max(@as(u64, 1), remaining.value / (servers.count - resolver_index));
+        const attempt = try network.deadline(try network.sample(app.sys), .{ .kind = a.timeout_kind_finite, .nanoseconds = share });
+        answers = exchangeDns(app, state, &state.cache[slot], &udp, backend, server, query_buffer[0..query_length], id, name, family, process, attempt, operation) catch |err| {
+            if (err == error.AuthoritativeNoData) return error.NotFound;
+            const transport_error: network.Error = @errorCast(err);
+            last_error = transport_error;
+            if (transport_error == error.Timeout) state.timeouts +%= 1;
+            if (state.cache[slot].pending_socket.socket != 0) return transport_error;
+            if (transport_error == error.Timeout or transport_error == error.Backend or transport_error == error.NotFound or transport_error == error.UnsupportedFamily) {
+                continue;
+            }
+            return transport_error;
+        };
+        selected = server;
+        break;
     }
+    const server = selected orelse return last_error;
+    const ip: [4]u8 = if (server.address.family == 4) server.address.bytes[0..4].* else .{0} ** 4;
     // Recheck exact source clock/deadline before publishing copied results.
     try network.checkAttempt(app.sys, req.deadline);
     if (!network.ownerAlive(app.sys, process)) return error.BadSocket;
@@ -1192,10 +1213,11 @@ fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *DnsSt
     const expiry = std.math.add(u64, completed.instant_ns, a.network_lease_ns) catch return error.Capacity;
     const query = state.next_query;
     state.next_query = std.math.add(u64, query, 1) catch 0;
-    state.cache[slot] = .{ .valid = true, .server = ip, .answer = answers.addresses[0].bytes[0..4].*, .updated_seconds = nowSeconds(app), .ttl_seconds = answers.ttl_seconds, .query_id = query, .query_owner = owner, .query_owner_generation = process.generation, .query_expires_ns = expiry, .query_answers = answers, .query_port = server.port };
+    const pending_socket = state.cache[slot].pending_socket;
+    state.cache[slot] = .{ .valid = true, .typed_only = req.family != 4 or server.address.family != 4 or server.port != dns_port, .typed_server = server, .pending_socket = pending_socket, .server = ip, .answer = if (req.family == 4) answers.addresses[0].bytes[0..4].* else .{0} ** 4, .updated_seconds = nowSeconds(app), .ttl_seconds = answers.ttl_seconds, .query_id = query, .query_owner = owner, .query_owner_generation = process.generation, .query_expires_ns = expiry, .query_answers = answers, .query_port = server.port };
     copyFixed(&state.cache[slot].name, name);
     state.cache_stores +%= 1;
-    state.a_records +%= answers.count;
+    if (req.family == 4) state.a_records +%= answers.count else state.aaaa_records +%= answers.count;
     const rc = try networkPage(app, endpoint, request_id, state, &state.cache[slot], 0, req.capacity);
     if (rc == a.service_api_result_not_found) {
         state.cache[slot].query_id = 0;
@@ -1204,6 +1226,143 @@ fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *DnsSt
     }
     return rc;
 }
+fn configuredResolvers(app: *const App, state: *DnsState, server: r4os.abi.NetworkEndpoint) network.Error!resolvers.List {
+    const a = r4os.abi;
+    if (!std.mem.allEqual(u8, std.mem.asBytes(&server), 0)) {
+        if (!network.endpointValid(server) or server.port == 0 or std.mem.allEqual(u8, &server.address.bytes, 0)) return error.Invalid;
+        if (server.address.family == 4) {
+            _ = try network.ipv4(server, false);
+            if (server.address.bytes[0] >= 224) return error.UnsupportedPolicy;
+        } else {
+            const bytes = server.address.bytes;
+            if (bytes[0] == 0xff or std.mem.eql(u8, bytes[0..12], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) return error.UnsupportedPolicy;
+            const ll = bytes[0] == 0xfe and bytes[1] & 0xc0 == 0x80;
+            if (ll and server.address.scope_id == 0 or !ll and server.address.scope_id != 0 or ll and server.address.interface_id != 0 and server.address.interface_id != server.address.scope_id) return error.UnsupportedScope;
+        }
+        var list: resolvers.List = .{ .count = 1 };
+        list.entries[0] = .{ .family = server.address.family, .bytes = server.address.bytes, .port = server.port, .scope = server.address.scope_id, .interface = if (server.address.interface_id != 0) server.address.interface_id else server.address.scope_id };
+        return list;
+    }
+    const path = "C:\\R4OS\\CONFIG\\RESOLVERS.R4S";
+    var info: a.FileInfo = .{};
+    const code = app.sys.fileInfoRaw(path, &info);
+    if (code < 0) return error.Backend;
+    if (code == 1) {
+        if (info.is_dir != 0 or info.size > 4096) return error.Capacity;
+        var buffer: [4096]u8 = undefined;
+        const got = app.sys.fileRead(path, &buffer);
+        if (got < 0 or got != info.size) return error.Backend;
+        const list = resolvers.parse(buffer[0..@intCast(got)]) catch |err| return if (err == error.Capacity) error.Capacity else error.Invalid;
+        if (list.count != 0) return list;
+    } else if (code != 0) return error.Backend;
+    const fallback = configuredDnsServer(app, state) orelse return error.NotFound;
+    var list: resolvers.List = .{ .count = 1 };
+    list.entries[0] = .{ .family = 4 };
+    @memcpy(list.entries[0].bytes[0..4], &fallback);
+    return list;
+}
+
+fn closeDnsSocket(client: *r4os.network_family.Client, socket: *r4os.abi.NetworkSocketResult) bool {
+    const a = r4os.abi;
+    if (socket.socket == 0) return true;
+    var empty: [0]u8 = .{};
+    var result: a.NetworkSocketResult = .{};
+    const code = client.socket(a.network_op_close, .{ .provider = socket.provider, .socket = socket.socket, .generation = socket.generation }, "", &empty, &result);
+    if (code == 0 or code == a.network_error_provider_changed or code == a.network_error_bad_socket) {
+        socket.* = .{};
+        return true;
+    }
+    return false;
+}
+fn cleanupDnsSockets(app: *const App, state: *DnsState) bool {
+    var pending = false;
+    for (state.cache) |entry| if (entry.pending_socket.socket != 0) {
+        pending = true;
+        break;
+    };
+    if (!pending) return false;
+    var client: r4os.network_family.Client = undefined;
+    if (r4os.network_family.Client.connectProvider(app.sys, .udp, &client) != 0) return true;
+    defer _ = client.close();
+    // This is owner cleanup after the caller's operation, not a fresh query
+    // budget. A missing acknowledgement keeps the original cache slot pinned.
+    client.timeout_ticks = 1;
+    pending = false;
+    for (&state.cache) |*entry| if (!closeDnsSocket(&client, &entry.pending_socket)) {
+        pending = true;
+    };
+    return pending;
+}
+fn dnsCallBudget(app: *const App, client: *r4os.network_family.Client, budget: r4os.abi.NetworkDeadline) network.Error!void {
+    const remaining = try network.remaining(app.sys, budget);
+    if (remaining.kind == 0) return error.Timeout;
+    if (remaining.kind != 1 or budget.tick_hz == 0) return error.Invalid;
+    client.timeout_ticks = @max(@as(u64, 1), r4os.time_contract.checked.scaleCeil(remaining.value, budget.tick_hz, 1_000_000_000) catch return error.Invalid);
+}
+fn dnsPeer(server: r4os.abi.NetworkEndpoint, actual: r4os.abi.NetworkEndpoint) bool {
+    return server.port == actual.port and server.address.family == actual.address.family and server.address.scope_id == actual.address.scope_id and (server.address.interface_id == 0 or server.address.interface_id == actual.address.interface_id) and std.mem.eql(u8, &server.address.bytes, &actual.address.bytes);
+}
+fn exchangeDns(app: *const App, state: *DnsState, cache: *DnsCacheEntry, client: *r4os.network_family.Client, backend: r4os.abi.NetworkProviderInfo, server: r4os.abi.NetworkEndpoint, query: []const u8, id: u16, name: []const u8, family: dns_codec.Family, owner: r4os.abi.ProgramProcessHandle, attempt: r4os.abi.NetworkDeadline, operation: r4os.abi.NetworkDeadline) (network.Error || error{AuthoritativeNoData})!dns_codec.Answer {
+    const a = r4os.abi;
+    if (cache.pending_socket.socket != 0) return error.Capacity;
+    if (network.ownerGone(app.sys, owner)) return error.BadSocket;
+    try dnsCallBudget(app, client, attempt);
+    var empty: [0]u8 = .{};
+    var result: a.NetworkSocketResult = .{};
+    const local: a.NetworkEndpoint = .{ .address = .{ .family = server.address.family, .interface_id = server.address.interface_id }, .port = dnsSourcePort(id) };
+    try r4os.network_transport.status(client.socket(a.network_op_bind, .{ .provider = backend.provider, .deadline = attempt, .endpoint = local }, "", &empty, &result));
+    cache.pending_socket = result;
+    defer {
+        if (dnsCallBudget(app, client, operation)) |_| {
+            _ = closeDnsSocket(client, &cache.pending_socket);
+        } else |_| {}
+    }
+    var request: a.NetworkSocketRequest = .{ .provider = backend.provider, .socket = result.socket, .generation = result.generation, .deadline = attempt, .endpoint = server, .bytes = @intCast(query.len) };
+    while (true) {
+        if (network.ownerGone(app.sys, owner)) return error.BadSocket;
+        try dnsCallBudget(app, client, attempt);
+        const code = client.socket(a.network_op_send, request, query, &empty, &result);
+        if (code == a.network_error_would_block) {
+            app.sys.sleepTicks(1);
+            continue;
+        }
+        try r4os.network_transport.status(code);
+        if (result.bytes != query.len or result.state != a.network_state_ready) return error.Backend;
+        state.queries_tx +%= 1;
+        break;
+    }
+    request.endpoint = .{};
+    request.bytes = @min(backend.max_recv, 4008);
+    if (request.bytes == 0) return error.Backend;
+    var buffer: [4008]u8 = undefined;
+    while (true) {
+        if (network.ownerGone(app.sys, owner)) return error.BadSocket;
+        try dnsCallBudget(app, client, attempt);
+        try r4os.network_transport.status(client.socket(a.network_op_recv, request, "", &buffer, &result));
+        if (result.state == a.network_state_would_block) {
+            app.sys.sleepTicks(1);
+            continue;
+        }
+        if (result.state != a.network_state_ready) return error.Backend;
+        if (!dnsPeer(server, result.endpoint)) continue;
+        if (result.flags & a.network_flag_truncated != 0) return error.TruncatedDns;
+        var answers: dns_codec.Answer = .{};
+        dns_codec.parseResponse(buffer[0..result.bytes], id, name, family, &answers) catch |err| switch (err) {
+            error.Mismatch => continue,
+            error.Truncated => return error.TruncatedDns,
+            error.NotFound, error.NoData => return error.AuthoritativeNoData,
+            error.Capacity => return error.Capacity,
+            error.ServerFailure => return error.Backend,
+            else => {
+                state.malformed +%= 1;
+                return error.Invalid;
+            },
+        };
+        state.responses_rx +%= 1;
+        return answers;
+    }
+}
+
 fn networkPage(app: *const App, endpoint: u32, request_id: u32, state: *DnsState, entry: *const DnsCacheEntry, cursor: u32, capacity: u32) network.Error!i32 {
     const a = r4os.abi;
     if (capacity == 0 or capacity > 16 or cursor >= entry.query_answers.count) return error.Invalid;

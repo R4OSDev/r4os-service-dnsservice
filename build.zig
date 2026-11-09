@@ -13,4 +13,6 @@ pub fn build(b: *std.Build) void {
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
         .zig_module_roots = &.{dns.path("src/address_codec.zig")},
     });
+    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/resolvers.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }) });
+    b.step("test", "Run ordered resolver literal and configuration boundary cases").dependOn(&b.addRunArtifact(tests).step);
 }

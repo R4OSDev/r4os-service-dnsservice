@@ -1,7 +1,7 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=DNSSVC
-VERSION=0.1.6
+VERSION=0.1.7
 LANGUAGE=Zig
 SOURCE=src/main.zig
 ZIG_MODULE=dns_address_codec:src/address_codec.zig
