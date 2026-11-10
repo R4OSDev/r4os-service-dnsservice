@@ -1,6 +1,6 @@
 .{
     .name = .r4os_dnssvc,
-    .version = "0.1.1",
+    .version = "0.1.8",
     .fingerprint = 0xefcd8a4d36246060,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -9,8 +9,8 @@
             .hash = "r4os_protocol_netdns-0.1.1-eHNSIEybAACaocigJNEp1J9i7oW2WAYoSxtzf45mv9wW",
         },
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/eb4b43b2205ea942d926893bee9733c867f7e95b.tar.gz",
-            .hash = "r4os_sdk-0.64.176-NnPzAjBu_gGPhyVGoIrr7fTmpR7VvDWv2kC4qTpQx9wv",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/f7ff27d803a52602cbe5e190fc5dfc316729819a.tar.gz",
+            .hash = "r4os_sdk-0.64.197-NnPzAs97CwK5rqPGgQ4vUMypAr_6aLrE-ZlPb9tsWAsN",
         },
     },
     .paths = .{

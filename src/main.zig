@@ -81,7 +81,7 @@ const App = struct {
     sys: r4os.r4sys.Context,
     net: r4os.r4net.Context,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .net = r4_app.networkLowLevel() orelse return null,
@@ -89,10 +89,10 @@ const App = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(app.sys.argsRaw(), selftest_arg)) return runSelfTest(&app);
-    if (hasArg(app.sys.argsRaw(), ping_arg)) return runPing(&app);
+    if (hasArg(app.sys.argsRaw(), selftest_arg) catch return r4os.abi.service_api_result_invalid) return runSelfTest(&app);
+    if (hasArg(app.sys.argsRaw(), ping_arg) catch return r4os.abi.service_api_result_invalid) return runPing(&app);
     return runService(&app);
 }
 
@@ -101,8 +101,14 @@ fn runService(app: *const App) i32 {
 
     var info: r4os.abi.ServiceInfo = .{};
     var handle: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < 100 and handle == 0) : (waited += 1) {
+    const actual = app.sys.base.generation2 orelse return r4os.abi.err_no_group;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
+    var registration_budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 100) catch |err| return r4os.rpc_budget.code(err);
+    while (handle == 0 and !app.sys.programShouldClose()) {
+        _ = registration_budget.remainingTicks() catch |err| {
+            if (err == error.TimedOut) break;
+            return r4os.rpc_budget.code(err);
+        };
         const rc = app.sys.serviceEndpointRegister(service_name, 0, &info);
         if (rc == r4os.abi.service_api_result_ok and info.handle != 0) {
             handle = info.handle;
@@ -504,6 +510,9 @@ fn localContractSelfTest(app: *const App) bool {
 }
 
 fn ensureRunningAndOpen(app: *const App, out_handle: *u32) bool {
+    const actual = app.sys.base.generation2 orelse return false;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return false;
+    var open_budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 160) catch return false;
     var info: r4os.abi.ServiceInfo = .{};
     const status = app.sys.serviceStatus(service_name, &info);
     if (status != r4os.abi.service_api_result_ok) return false;
@@ -511,8 +520,8 @@ fn ensureRunningAndOpen(app: *const App, out_handle: *u32) bool {
         const start = app.sys.serviceStart(service_name, &info);
         if (start != r4os.abi.service_api_result_ok) return false;
     }
-    var tick: u32 = 0;
-    while (tick < 160) : (tick += 1) {
+    while (!app.sys.programShouldClose()) {
+        _ = open_budget.remainingTicks() catch return false;
         const open_rc = app.sys.serviceOpen(service_name, &info);
         if (open_rc == r4os.abi.service_api_result_ok and info.handle != 0) {
             out_handle.* = info.handle;
@@ -936,13 +945,12 @@ fn fail(app: *const App, label: []const u8) i32 {
     return 1;
 }
 
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
+fn hasArg(args: [*:0]const u8, wanted: []const u8) r4os.arguments.Error!bool {
+    const raw = std.mem.span(args);
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try r4os.arguments.ArgCursor.init(raw, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none), .max_bytes = 256 }, &failure);
+    while (try cursor.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(try token.bytes(raw), wanted)) return true;
     }
     return false;
 }
