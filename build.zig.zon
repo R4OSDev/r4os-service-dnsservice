@@ -9,8 +9,8 @@
             .hash = "r4os_protocol_netdns-0.1.2-eHNSIM6eAADp6OVirAPcmhtcuLEAR_UD1DuCMHIwkX6P",
         },
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/f7ff27d803a52602cbe5e190fc5dfc316729819a.tar.gz",
-            .hash = "r4os_sdk-0.64.197-NnPzAs97CwK5rqPGgQ4vUMypAr_6aLrE-ZlPb9tsWAsN",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/e8e5063b11d646796c03e3f3bae28438fd591657.tar.gz",
+            .hash = "r4os_sdk-0.64.208-NnPzAk1RDgLr3JUg_en2WgXRl26zcl2vTgGiWrmHf_sW",
         },
     },
     .paths = .{
