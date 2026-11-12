@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_protocol_netdns = .{
-            .url = "https://github.com/R4OSDev/r4os-protocol-netdns/archive/3ebca23a32889b680589e8a5fcd0bd621996e52c.tar.gz",
-            .hash = "r4os_protocol_netdns-0.1.2-eHNSIM6eAADp6OVirAPcmhtcuLEAR_UD1DuCMHIwkX6P",
+            .url = "https://github.com/R4OSDev/r4os-protocol-netdns/archive/c5ec17132daac540536244722569ec5e025201c5.tar.gz",
+            .hash = "r4os_protocol_netdns-0.1.2-eHNSIM6eAAC_kFzGm4V3kA_tsooLUg2Nez-iRjlTv7nm",
         },
         .r4os_sdk = .{
             .url = "https://github.com/R4OSDev/r4os-sdk/archive/ec82f108eb1874b65e0417140d177c7f90b65fbe.tar.gz",
