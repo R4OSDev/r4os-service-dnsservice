@@ -289,11 +289,13 @@ fn resolveA(app: *const App, state: *DnsState, name: []const u8, explicit_server
     defer clearPending(state);
 
     const timeout_ticks = app.sys.ticksFromMilliseconds(dns_timeout_ms);
-    const deadline = app.sys.ticks() + timeout_ticks;
+    const started = app.sys.ticks();
     var response: [dns_query_max]u8 = undefined;
-    while (app.sys.ticks() <= deadline) {
+    while (true) {
+        const elapsed = app.sys.ticks() -% started;
+        if (elapsed >= timeout_ticks) break;
+        const remaining = timeout_ticks - elapsed;
         var info: r4os.abi.UdpRecvInfo = .{};
-        const remaining = if (deadline > app.sys.ticks()) deadline - app.sys.ticks() else 1;
         const got = app.net.udpRecvFromWait(udp_handle, &info, response[0..], remaining);
         if (got < 0) {
             state.tx_errors +%= 1;
