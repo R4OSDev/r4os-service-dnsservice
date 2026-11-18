@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_protocol_netdns = .{
-            .url = "https://github.com/R4OSDev/r4os-protocol-netdns/archive/c05ce3d19d665ba9ac71bf29737ed92613ad3f2c.tar.gz",
-            .hash = "r4os_protocol_netdns-0.1.2-eHNSIM6eAAD07gw9WFEeV6AuFN7zkzYQ_nzRlB3G-1PA",
+            .url = "https://github.com/R4OSDev/r4os-protocol-netdns/archive/dac7bab39bf5f45ec4ddfedafbfb365f3b21f831.tar.gz",
+            .hash = "r4os_protocol_netdns-0.1.2-eHNSIM6eAABUb501_f1UhMNSvguGiyP6DMJQyfGPTwpz",
         },
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/cff74f919723933cddb33ee91043cc376f03c053.tar.gz",
-            .hash = "r4os_sdk-0.64.236-NnPzAjuHGgKQSerP3CfVEfBWcz4svGZkSHwqnqauWHKi",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/c5871c461d6fa322ade20955c5a9ddfe7743c0e5.tar.gz",
+            .hash = "r4os_sdk-0.64.237-NnPzAoyRGgKB3pYXki0ZqvSXN8H0mmsU666YhLnFtk3p",
         },
     },
     .paths = .{
